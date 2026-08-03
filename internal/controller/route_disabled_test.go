@@ -174,7 +174,8 @@ func TestReconcileDeleteRetainsFinalizerWhenRouteCleanupFails(t *testing.T) {
 		ObjectMeta: metav1.ObjectMeta{Name: "test-gateway", Finalizers: []string{finalizerName}},
 		Spec:       ogov1alpha1.OpenShellGatewaySpec{Namespace: "test-namespace"},
 	}
-	fakeClient := clientfake.NewClientBuilder().WithScheme(scheme).WithObjects(gw).
+	gatewayCA := managedGatewayCAConfigMap(gw, gw.Spec.Namespace, "ca")
+	fakeClient := clientfake.NewClientBuilder().WithScheme(scheme).WithObjects(gw, gatewayCA).
 		WithInterceptorFuncs(interceptor.Funcs{
 			List: func(ctx context.Context, c client.WithWatch, list client.ObjectList, opts ...client.ListOption) error {
 				if list.GetObjectKind().GroupVersionKind() == routeGVK.GroupVersion().WithKind("RouteList") {
@@ -198,6 +199,7 @@ func TestReconcileDeleteRetainsFinalizerWhenRouteCleanupFails(t *testing.T) {
 	if !slices.Contains(updated.Finalizers, finalizerName) {
 		t.Fatal("finalizer was removed after Route cleanup failed")
 	}
+	assertConfigMapMissing(t, fakeClient, gatewayCA)
 }
 
 func TestRouteReconcilersRejectUnmanagedCollisions(t *testing.T) {

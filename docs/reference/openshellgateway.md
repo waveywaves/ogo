@@ -51,6 +51,12 @@ tags: [crd, gateway]
 | `certManager.issuerName` | string | `letsencrypt` | cert-manager issuer name |
 | `certManager.issuerKind` | enum | `ClusterIssuer` | `ClusterIssuer` or `Issuer` |
 
+When TLS is enabled, OGO publishes the public CA used by the gateway Service in
+the `<gateway>-gateway-ca` ConfigMap. The ConfigMap contains only `ca.crt`; it
+does not contain private keys or client credentials. OGO updates it when the
+source TLS Secret rotates and removes it when TLS or the gateway is removed.
+This CA is distinct from the auth bridge CA in `<gateway>-auth-ca`.
+
 ### `spec.route`
 
 | Field | Type | Default | Description |

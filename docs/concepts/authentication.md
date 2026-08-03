@@ -45,6 +45,11 @@ oc get secret openshell-client-tls -n ogo -o jsonpath='{.data.tls\.crt}' | base6
 oc get secret openshell-client-tls -n ogo -o jsonpath='{.data.tls\.key}' | base64 -d > client.key
 ```
 
+Bearer-authenticated clients can trust the gateway without reading either TLS
+Secret. OGO publishes only the public gateway CA as `ca.crt` in the
+`{gateway}-gateway-ca` ConfigMap. This gateway CA is separate from the
+`{gateway}-auth-ca` ConfigMap used to trust the OpenShift auth bridge.
+
 ## Sandbox bootstrap
 
 When a sandbox pod starts, the supervisor process inside it must

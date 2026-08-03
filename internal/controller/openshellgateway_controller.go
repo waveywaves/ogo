@@ -21,6 +21,7 @@ import (
 	"crypto/rand"
 	"crypto/sha256"
 	"fmt"
+	"maps"
 	"slices"
 	"sort"
 	"strings"
@@ -64,6 +65,8 @@ const (
 	managedByValue   = "ogo"
 	defaultNamespace = "ogo"
 	phaseFailed      = "Failed"
+	gatewayCASuffix  = "-gateway-ca"
+	gatewayCAKey     = "ca.crt"
 
 	// reasonHostnameMissing is set by both reconcileGatewayAPI and
 	// reconcileEnvoyRoute (each independently checks route.hostname, since
@@ -311,6 +314,10 @@ func (r *OpenShellGatewayReconciler) reconcileDelete(ctx context.Context, gw *og
 		log.Error(err, "Failed to delete managed Routes")
 		cleanupErrors = append(cleanupErrors, err)
 	}
+	if err := r.deleteManagedGatewayCAConfigMaps(ctx, gw, ""); err != nil {
+		log.Error(err, "Failed to delete managed gateway CA ConfigMaps")
+		cleanupErrors = append(cleanupErrors, err)
+	}
 	for _, obj := range clusterResources {
 		if err := r.Delete(ctx, obj); err != nil && !apierrors.IsNotFound(err) {
 			log.Error(err, "Failed to delete cluster resource", "resource", obj.GetName())
@@ -476,30 +483,115 @@ func (r *OpenShellGatewayReconciler) reconcileRoleBinding(ctx context.Context, g
 
 func (r *OpenShellGatewayReconciler) reconcileTLS(ctx context.Context, gw *ogov1alpha1.OpenShellGateway) error {
 	if gw.Spec.TLS.Enabled != nil && !*gw.Spec.TLS.Enabled {
-		return nil
+		return r.deleteManagedGatewayCAConfigMaps(ctx, gw, "")
 	}
 
-	if gw.Spec.TLS.ServerCertSecretName != "" {
-		return nil
+	if gw.Spec.TLS.ServerCertSecretName == "" {
+		// Always generate self-signed certs for internal mTLS (client certs,
+		// CA) — the gateway pod's own listener never presents a publicly
+		// trusted cert, since it also has to be trusted by the self-signed
+		// client CA for supervisor mTLS. When cert-manager is enabled,
+		// separately issue a public cert for the Gateway API listener only
+		// (see reconcileGatewayAPI / reconcileGatewayTLSCert).
+		if err := r.reconcileSelfSignedTLS(ctx, gw); err != nil {
+			return err
+		}
 	}
 
-	// Always generate self-signed certs for internal mTLS (client certs,
-	// CA) — the gateway pod's own listener never presents a publicly
-	// trusted cert, since it also has to be trusted by the self-signed
-	// client CA for supervisor mTLS. When cert-manager is enabled,
-	// separately issue a public cert for the Gateway API listener only
-	// (see reconcileGatewayAPI / reconcileGatewayTLSCert).
-	if err := r.reconcileSelfSignedTLS(ctx, gw); err != nil {
+	if err := r.reconcileGatewayCAConfigMap(ctx, gw); err != nil {
 		return err
 	}
 
-	if gw.Spec.TLS.CertManager.Enabled && gw.Spec.Route.Hostname != "" {
+	if gw.Spec.TLS.ServerCertSecretName == "" && gw.Spec.TLS.CertManager.Enabled && gw.Spec.Route.Hostname != "" {
 		certSecretName := gw.Name + "-gateway-tls"
 		if err := r.reconcileGatewayTLSCert(ctx, gw, certSecretName, gw.Spec.Route.Hostname); err != nil {
 			return fmt.Errorf("reconciling cert-manager TLS certificate: %w", err)
 		}
 	}
 
+	return nil
+}
+
+func gatewayServerTLSSecretName(gw *ogov1alpha1.OpenShellGateway) string {
+	if gw.Spec.TLS.ServerCertSecretName != "" {
+		return gw.Spec.TLS.ServerCertSecretName
+	}
+	return gw.Name + "-server-tls"
+}
+
+func gatewayCAConfigMapName(gw *ogov1alpha1.OpenShellGateway) string {
+	return gw.Name + gatewayCASuffix
+}
+
+func (r *OpenShellGatewayReconciler) reconcileGatewayCAConfigMap(ctx context.Context, gw *ogov1alpha1.OpenShellGateway) error {
+	ns := gatewayNamespace(gw)
+	secretName := gatewayServerTLSSecretName(gw)
+	secret := &corev1.Secret{}
+	if err := r.Get(ctx, types.NamespacedName{Name: secretName, Namespace: ns}, secret); err != nil {
+		return fmt.Errorf("reading gateway TLS Secret %s/%s: %w", ns, secretName, err)
+	}
+
+	ca := secret.Data[gatewayCAKey]
+	if len(ca) == 0 {
+		ca = secret.Data[corev1.TLSCertKey]
+	}
+	if len(ca) == 0 {
+		return fmt.Errorf("gateway TLS Secret %s/%s is missing %s and %s", ns, secretName, gatewayCAKey, corev1.TLSCertKey)
+	}
+
+	name := gatewayCAConfigMapName(gw)
+	existing := &corev1.ConfigMap{}
+	err := r.Get(ctx, types.NamespacedName{Name: name, Namespace: ns}, existing)
+	if apierrors.IsNotFound(err) {
+		cm := &corev1.ConfigMap{
+			ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: ns, Labels: gatewayLabels(gw)},
+			Data:       map[string]string{gatewayCAKey: string(ca)},
+		}
+		if err := r.Create(ctx, cm); err != nil {
+			return fmt.Errorf("creating gateway CA ConfigMap: %w", err)
+		}
+		return r.deleteManagedGatewayCAConfigMaps(ctx, gw, ns)
+	}
+	if err != nil {
+		return fmt.Errorf("reading gateway CA ConfigMap: %w", err)
+	}
+	labels := existing.GetLabels()
+	if labels[labelManagedBy] != managedByValue || labels[labelInstance] != gw.Name {
+		return fmt.Errorf("ConfigMap %s/%s exists but is not managed by OGO", ns, name)
+	}
+
+	desiredLabels := gatewayLabels(gw)
+	desiredData := map[string]string{gatewayCAKey: string(ca)}
+	if maps.Equal(existing.Labels, desiredLabels) && maps.Equal(existing.Data, desiredData) && len(existing.BinaryData) == 0 {
+		return r.deleteManagedGatewayCAConfigMaps(ctx, gw, ns)
+	}
+	existing.Labels = desiredLabels
+	existing.Data = desiredData
+	existing.BinaryData = nil
+	if err := r.Update(ctx, existing); err != nil {
+		return fmt.Errorf("updating gateway CA ConfigMap: %w", err)
+	}
+	return r.deleteManagedGatewayCAConfigMaps(ctx, gw, ns)
+}
+
+func (r *OpenShellGatewayReconciler) deleteManagedGatewayCAConfigMaps(ctx context.Context, gw *ogov1alpha1.OpenShellGateway, keepNamespace string) error {
+	configMaps := &corev1.ConfigMapList{}
+	if err := r.List(ctx, configMaps, client.MatchingLabels{
+		labelManagedBy: managedByValue,
+		labelInstance:  gw.Name,
+	}); err != nil {
+		return fmt.Errorf("listing managed gateway CA ConfigMaps: %w", err)
+	}
+	name := gatewayCAConfigMapName(gw)
+	for i := range configMaps.Items {
+		configMap := &configMaps.Items[i]
+		if configMap.Name != name || keepNamespace != "" && configMap.Namespace == keepNamespace {
+			continue
+		}
+		if err := r.Delete(ctx, configMap); err != nil && !apierrors.IsNotFound(err) {
+			return fmt.Errorf("deleting managed gateway CA ConfigMap %s/%s: %w", configMap.Namespace, configMap.Name, err)
+		}
+	}
 	return nil
 }
 
@@ -732,10 +824,7 @@ func (r *OpenShellGatewayReconciler) reconcileDeployment(ctx context.Context, gw
 		}
 
 		if tlsEnabled {
-			serverSecretName := gw.Name + "-server-tls"
-			if gw.Spec.TLS.ServerCertSecretName != "" {
-				serverSecretName = gw.Spec.TLS.ServerCertSecretName
-			}
+			serverSecretName := gatewayServerTLSSecretName(gw)
 			clientCASecretName := gw.Name + "-client-tls"
 			volumes = append(volumes,
 				corev1.Volume{Name: "tls-cert", VolumeSource: corev1.VolumeSource{
